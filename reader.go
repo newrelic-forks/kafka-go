@@ -760,12 +760,9 @@ func (r *Reader) commitLoop(conn *Conn) func(stop <-chan struct{}) {
 }
 
 // partitionWatcher queries kafka and watches for partition changes, triggering a rebalance if changes are found.
-// Similar to heartbeat it's okay to return on error here as if you are unable to ask a broker for basic metadata
-// you're in a bad spot and should rebalance. Commonly you will see an error here if there is a problem with
-// the connection to the coordinator and a rebalance will establish a new connection to the coordinator.
-func (r *Reader) partitionWatcher(conn partitionReader) func(stop <-chan struct{}) {
+func (r *Reader) partitionWatcher(conn *Conn) func(stop <-chan struct{}) {
 	return func(stop <-chan struct{}) {
-		ticker := time.NewTicker(r.config.PartitionWatchInterval)
+		ticker := time.NewTicker(defaultPartitionWatchTime)
 		defer ticker.Stop()
 		ops, err := conn.ReadPartitions(r.config.Topic)
 		if err != nil {
@@ -774,7 +771,12 @@ func (r *Reader) partitionWatcher(conn partitionReader) func(stop <-chan struct{
 			})
 			return
 		}
-		oParts := len(ops)
+		// It's possible that the list of partitions returned are not in any order
+		// so put them into a map to compare.
+		oParts := make(map[int]struct{})
+		for _, p := range ops {
+			oParts[p.ID] = struct{}{}
+		}
 		for {
 			select {
 			case <-stop:
@@ -787,11 +789,19 @@ func (r *Reader) partitionWatcher(conn partitionReader) func(stop <-chan struct{
 					})
 					return
 				}
-				if len(ops) != oParts {
+				if len(ops) != len(oParts) {
 					r.withErrorLogger(func(l *log.Logger) {
 						l.Printf("Partition changes found, reblancing group: %v.", r.config.GroupID)
 					})
 					return
+				}
+				for _, p := range ops {
+					if _, ok := oParts[p.ID]; !ok {
+						r.withErrorLogger(func(l *log.Logger) {
+							l.Printf("Found new partition %v, on group %v", p.ID, r.config.GroupID)
+						})
+						return
+					}
 				}
 			}
 		}
@@ -942,19 +952,6 @@ type ReaderConfig struct {
 	// Only used when GroupID is set
 	CommitInterval time.Duration
 
-	// PartitionWatchInterval indicates how often a reader checks for partition changes.
-	// If a reader sees a partition change (such as a partition add) it will rebalance the group
-	// picking up new partitions.
-	//
-	// Default: 5s
-	//
-	// Only used when GroupID is set and WatchPartitionChanges is set.
-	PartitionWatchInterval time.Duration
-
-	// WatchForPartitionChanges is used to inform kafka-go that a consumer group should be
-	// polling the brokers and rebalancing if any partition changes happen to the topic.
-	WatchPartitionChanges bool
-
 	// SessionTimeout optionally sets the length of time that may pass without a heartbeat
 	// before the coordinator considers the consumer dead and initiates a rebalance.
 	//
@@ -987,6 +984,10 @@ type ReaderConfig struct {
 	// ErrorLogger is the logger used to report errors. If nil, the reader falls
 	// back to using Logger instead.
 	ErrorLogger *log.Logger
+
+	// WatchForPartitionChanges is used to inform kafka-go that a consumer group should be
+	// polling the brokers and rebalancing if any partition changes happen to the topic.
+	WatchPartitionChanges bool
 }
 
 // ReaderStats is a data structure returned by a call to Reader.Stats that exposes
@@ -1098,11 +1099,6 @@ func NewReader(config ReaderConfig) *Reader {
 		if config.CommitInterval < 0 || (config.CommitInterval/time.Millisecond) >= math.MaxInt32 {
 			panic(fmt.Sprintf("CommitInterval out of bounds: %d", config.CommitInterval))
 		}
-
-		if config.PartitionWatchInterval < 0 || (config.PartitionWatchInterval/time.Millisecond) >= math.MaxInt32 {
-			panic(fmt.Sprintf("PartitionWachInterval out of bounds %d", config.PartitionWatchInterval))
-		}
-
 	}
 
 	if config.Dialer == nil {
@@ -1135,10 +1131,6 @@ func NewReader(config ReaderConfig) *Reader {
 
 	if config.SessionTimeout == 0 {
 		config.SessionTimeout = defaultSessionTimeout
-	}
-
-	if config.PartitionWatchInterval == 0 {
-		config.PartitionWatchInterval = defaultPartitionWatchTime
 	}
 
 	if config.RebalanceTimeout == 0 {
@@ -1704,7 +1696,9 @@ func (r *reader) run(ctx context.Context, offset int64) {
 				r.withErrorLogger(func(log *log.Logger) {
 					log.Printf("failed to read from current broker for partition %d of %s at offset %d, topic or parition not found on this broker, %v", r.partition, r.topic, offset, r.brokers)
 				})
+
 				conn.Close()
+
 				// The next call to .initialize will re-establish a connection to the proper
 				// topic/partition broker combo.
 				r.stats.rebalances.observe(1)
