@@ -73,12 +73,16 @@ type WriterConfig struct {
 	// The default is to use a target batch size of 100 messages.
 	BatchSize int
 
+	// Controls how many times a writer will resend records that
+	// have failed with a potentailly transient error. This gets
+	// applied to both async and non. Setting it to 0 will disable
+	// these low level retries but MaxAttempt could still have message retied.
+	// That means for the Sync Writer message batches could be retied up to
+	// Retries * MaxAttempt times.
 	//
-	//
-	//
-	//
-	//
+	// The default is 0.
 	Retries int
+
 	// Limit the maximum size of a request in bytes before being sent to
 	// a partition.
 	//
@@ -152,6 +156,7 @@ type WriterStats struct {
 	BatchBytes SummaryStats  `metric:"kafka.writer.batch.bytes"`
 
 	MaxAttempts       int64         `metric:"kafka.writer.attempts.max"       type:"gauge"`
+	Retry             int64         `metric:"kafka.writer.retries.max"        type:"gauge"`
 	MaxBatchSize      int64         `metric:"kafka.writer.batch.max"          type:"gauge"`
 	BatchTimeout      time.Duration `metric:"kafka.writer.batch.timeout"      type:"gauge"`
 	ReadTimeout       time.Duration `metric:"kafka.writer.read.timeout"       type:"gauge"`
@@ -392,6 +397,7 @@ func (w *Writer) Stats() WriterStats {
 		BatchSize:         w.stats.batchSize.snapshot(),
 		BatchBytes:        w.stats.batchSizeBytes.snapshot(),
 		MaxAttempts:       int64(w.config.MaxAttempts),
+		Retry:             int64(w.config.Retries),
 		MaxBatchSize:      int64(w.config.BatchSize),
 		BatchTimeout:      w.config.BatchTimeout,
 		ReadTimeout:       w.config.ReadTimeout,
@@ -720,6 +726,7 @@ func (w *writer) write(conn *Conn, batch []Message, resch [](chan<- error)) (ret
 			case DuplicateSequenceNumber:
 				// we've moved beyond the batch but havn't noticed it. Just return sucess.
 				// See https://github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java#L617
+				err = nil
 				break
 			case TopicAuthorizationFailed, ClusterAuthorizationFailed, GroupAuthorizationFailed:
 				err = fmt.Errorf("auth error writing messages to %s (partition %d): %s", w.topic, w.partition, err)
@@ -727,7 +734,13 @@ func (w *writer) write(conn *Conn, batch []Message, resch [](chan<- error)) (ret
 
 			default:
 				attempts++
+				w.stats.writes.observe(1)
+				w.stats.retries.observe(1)
 				err = fmt.Errorf("error writing messages to %s (partition %d): %s", w.topic, w.partition, err)
+				w.withLogger(func(l *log.Logger) {
+					l.Printf("retrying batch due to potential transient error to %s (partition %d): %s",
+						w.topic, w.partition, err)
+				})
 				backoff(attempts, 5*time.Millisecond, 100*time.Millisecond)
 			}
 
