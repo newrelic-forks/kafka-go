@@ -73,6 +73,12 @@ type WriterConfig struct {
 	// The default is to use a target batch size of 100 messages.
 	BatchSize int
 
+	//
+	//
+	//
+	//
+	//
+	Retries int
 	// Limit the maximum size of a request in bytes before being sent to
 	// a partition.
 	//
@@ -536,6 +542,7 @@ type writer struct {
 	requiredAcks    int
 	batchSize       int
 	maxMessageBytes int
+	retries         int
 	batchTimeout    time.Duration
 	writeTimeout    time.Duration
 	dialer          *Dialer
@@ -557,6 +564,7 @@ func newWriter(partition int, config WriterConfig, stats *writerStats) *writer {
 		maxMessageBytes: config.BatchBytes,
 		batchTimeout:    config.BatchTimeout,
 		writeTimeout:    config.WriteTimeout,
+		retries:         config.Retries,
 		dialer:          config.Dialer,
 		msgs:            make(chan writerMessage, config.QueueCapacity),
 		stats:           stats,
@@ -704,8 +712,29 @@ func (w *writer) write(conn *Conn, batch []Message, resch [](chan<- error)) (ret
 
 	t0 := time.Now()
 	conn.SetWriteDeadline(time.Now().Add(w.writeTimeout))
-	if _, err = conn.WriteCompressedMessages(w.codec, batch...); err != nil {
-		w.stats.errors.observe(1)
+	attempts := 0
+	for w.retries > attempts {
+		if _, err = conn.WriteCompressedMessages(w.codec, batch...); err != nil {
+			w.stats.errors.observe(1)
+			switch err {
+			case DuplicateSequenceNumber:
+				// we've moved beyond the batch but havn't noticed it. Just return sucess.
+				// See https://github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java#L617
+				break
+			case TopicAuthorizationFailed, ClusterAuthorizationFailed, GroupAuthorizationFailed:
+				err = fmt.Errorf("auth error writing messages to %s (partition %d): %s", w.topic, w.partition, err)
+				break
+
+			default:
+				attempts++
+				err = fmt.Errorf("error writing messages to %s (partition %d): %s", w.topic, w.partition, err)
+				backoff(attempts, 5*time.Millisecond, 100*time.Millisecond)
+			}
+
+		}
+	}
+
+	if err != nil {
 		w.withErrorLogger(func(logger *log.Logger) {
 			logger.Printf("error writing messages to %s (partition %d): %s", w.topic, w.partition, err)
 		})
