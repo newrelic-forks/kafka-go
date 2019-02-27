@@ -731,12 +731,16 @@ func (w *writer) write(conn *Conn, batch []Message, resch [](chan<- error)) (ret
 	t0 := time.Now()
 	conn.SetWriteDeadline(time.Now().Add(w.writeTimeout))
 	attempts := 0
-	for w.retries > attempts {
+	for {
 		if _, err = conn.WriteCompressedMessages(w.codec, batch...); err != nil {
 			w.stats.errors.observe(1)
+			//Check if we've retried the correct amount of times.
+			if w.retries == attempts {
+				break
+			}
 			switch err {
 			case DuplicateSequenceNumber:
-				// we've moved beyond the batch but havn't noticed it. Just return sucess.
+				// we've moved beyond the batch but haven't noticed it. Just return success.
 				// See https://github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java#L617
 				err = nil
 				break
