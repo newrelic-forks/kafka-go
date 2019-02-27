@@ -715,7 +715,6 @@ func (w *writer) dial() (conn *Conn, err error) {
 }
 
 func (w *writer) write(conn *Conn, batch []Message, resch [](chan<- error)) (ret *Conn, err error) {
-	w.stats.writes.observe(1)
 	if conn == nil {
 		if conn, err = w.dial(); err != nil {
 			w.stats.errors.observe(1)
@@ -732,6 +731,7 @@ func (w *writer) write(conn *Conn, batch []Message, resch [](chan<- error)) (ret
 	t0 := time.Now()
 	attempts := 0
 	for {
+		w.stats.writes.observe(1)
 		conn.SetWriteDeadline(time.Now().Add(w.writeTimeout))
 		if _, err = conn.WriteCompressedMessages(w.codec, batch...); err != nil {
 			w.stats.errors.observe(1)
@@ -750,15 +750,15 @@ func (w *writer) write(conn *Conn, batch []Message, resch [](chan<- error)) (ret
 				break
 
 			default:
-				attempts++
-				w.stats.writes.observe(1)
-				w.stats.retries.observe(1)
+				attempts = attempts + 1
+				w.stats.retries.observe(int64(attempts))
 				err = fmt.Errorf("error writing messages to %s (partition %d): %s", w.topic, w.partition, err)
 				w.withLogger(func(l *log.Logger) {
 					l.Printf("retrying batch due to potential transient error to %s (partition %d): %s",
 						w.topic, w.partition, err)
 				})
 				backoff(attempts, w.retryBackoffInterval, w.retryBackoffInterval)
+				continue
 			}
 
 		}
@@ -767,7 +767,6 @@ func (w *writer) write(conn *Conn, batch []Message, resch [](chan<- error)) (ret
 	}
 
 	if err != nil {
-		fmt.Println("error ", err)
 		w.withErrorLogger(func(logger *log.Logger) {
 			logger.Print(err)
 		})
