@@ -73,17 +73,17 @@ type WriterConfig struct {
 	// The default is to use a target batch size of 100 messages.
 	BatchSize int
 
-	// Controls how many times a writer will resend records that
+	// Controls how many times a writer will attempt to resend records that
 	// have failed with a potentailly transient error. This gets
 	// applied to both async and non. Setting it to 0 will disable
 	// these low level retries but MaxAttempt could still have message retied.
-	// That means for the Sync Writer message batches could be retied up to
+	// That means for the Sync Writer message batches could be retried up to
 	// Retries * MaxAttempt times.
 	//
 	// The default is 0.
 	Retries int
 
-	// The amount of time waiting before attempting to re-send a batch.
+	// The amount of time waiting before attempting to resend a batch.
 	// This helps putting pressure on the brokers during failure scenarios.
 	//
 	// Defaults to 100ms
@@ -162,7 +162,7 @@ type WriterStats struct {
 	BatchBytes SummaryStats  `metric:"kafka.writer.batch.bytes"`
 
 	MaxAttempts          int64         `metric:"kafka.writer.attempts.max"       		type:"gauge"`
-	Retry                int64         `metric:"kafka.writer.retries.max"        		type:"gauge"`
+	MaxRetries           int64         `metric:"kafka.writer.retries.max"        		type:"gauge"`
 	RetryBackoffInterval time.Duration `metric:"kafka.writer.retrybackoff.interval"    	type:"gauge"`
 	MaxBatchSize         int64         `metric:"kafka.writer.batch.max"         		type:"gauge"`
 	BatchTimeout         time.Duration `metric:"kafka.writer.batch.timeout"     		type:"gauge"`
@@ -407,7 +407,7 @@ func (w *Writer) Stats() WriterStats {
 		BatchSize:            w.stats.batchSize.snapshot(),
 		BatchBytes:           w.stats.batchSizeBytes.snapshot(),
 		MaxAttempts:          int64(w.config.MaxAttempts),
-		Retry:                int64(w.config.Retries),
+		MaxRetries:           int64(w.config.Retries),
 		RetryBackoffInterval: w.config.RetryBackoffInterval,
 		MaxBatchSize:         int64(w.config.BatchSize),
 		BatchTimeout:         w.config.BatchTimeout,
@@ -574,21 +574,22 @@ type writer struct {
 
 func newWriter(partition int, config WriterConfig, stats *writerStats) *writer {
 	w := &writer{
-		brokers:         config.Brokers,
-		topic:           config.Topic,
-		partition:       partition,
-		requiredAcks:    config.RequiredAcks,
-		batchSize:       config.BatchSize,
-		maxMessageBytes: config.BatchBytes,
-		batchTimeout:    config.BatchTimeout,
-		writeTimeout:    config.WriteTimeout,
-		retries:         config.Retries,
-		dialer:          config.Dialer,
-		msgs:            make(chan writerMessage, config.QueueCapacity),
-		stats:           stats,
-		codec:           config.CompressionCodec,
-		logger:          config.Logger,
-		errorLogger:     config.ErrorLogger,
+		brokers:              config.Brokers,
+		topic:                config.Topic,
+		partition:            partition,
+		requiredAcks:         config.RequiredAcks,
+		batchSize:            config.BatchSize,
+		maxMessageBytes:      config.BatchBytes,
+		batchTimeout:         config.BatchTimeout,
+		writeTimeout:         config.WriteTimeout,
+		retries:              config.Retries,
+		retryBackoffInterval: config.RetryBackoffInterval,
+		dialer:               config.Dialer,
+		msgs:                 make(chan writerMessage, config.QueueCapacity),
+		stats:                stats,
+		codec:                config.CompressionCodec,
+		logger:               config.Logger,
+		errorLogger:          config.ErrorLogger,
 	}
 	w.join.Add(1)
 	go w.run()
@@ -729,9 +730,9 @@ func (w *writer) write(conn *Conn, batch []Message, resch [](chan<- error)) (ret
 	}
 
 	t0 := time.Now()
-	conn.SetWriteDeadline(time.Now().Add(w.writeTimeout))
 	attempts := 0
 	for {
+		conn.SetWriteDeadline(time.Now().Add(w.writeTimeout))
 		if _, err = conn.WriteCompressedMessages(w.codec, batch...); err != nil {
 			w.stats.errors.observe(1)
 			//Check if we've retried the correct amount of times.
@@ -761,9 +762,12 @@ func (w *writer) write(conn *Conn, batch []Message, resch [](chan<- error)) (ret
 			}
 
 		}
+		//Successful send
+		break
 	}
 
 	if err != nil {
+		fmt.Println("error ", err)
 		w.withErrorLogger(func(logger *log.Logger) {
 			logger.Print(err)
 		})
