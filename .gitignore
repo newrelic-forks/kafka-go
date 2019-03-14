@@ -29,7 +29,7 @@ _testmain.go
 
 # VIM
 *.swp
-
+*.swo
 # Goland
 .idea
 
