@@ -39,6 +39,11 @@ func TestReader(t *testing.T) {
 		},
 
 		{
+			scenario: "setting the offset by TimeStamp",
+			function: testReaderSetOffsetAt,
+		},
+
+		{
 			scenario: "calling Lag returns the lag of the last message read from kafka",
 			function: testReaderLag,
 		},
@@ -160,6 +165,43 @@ func testReaderSetRandomOffset(t *testing.T, ctx context.Context, r *Reader) {
 			t.Error("message at offset", offset, "has wrong value:", v)
 			return
 		}
+	}
+}
+
+func testReaderSetOffsetAt(t *testing.T, ctx context.Context, r *Reader) {
+	// We make 2 batches of messages here with a brief 2 second pause
+	// to ensure messages 0...9 will be written a few seconds before messages 10...19
+	// We'll then fetch the timestamp for message offset 10 and use that timestamp to set
+	// our reader
+	const N = 10
+	prepareReader(t, ctx, r, makeTestSequence(N)...)
+	time.Sleep(time.Second * 2)
+	prepareReader(t, ctx, r, makeTestSequence(N)...)
+
+	var ts time.Time
+	for i := 0; i < N*2; i++ {
+		m, err := r.ReadMessage(ctx)
+		if err != nil {
+			t.Error("error reading message", err)
+		}
+		// grab the time for the 10th message
+		if i == 10 {
+			ts = m.Time
+		}
+	}
+
+	err := r.SetOffsetAt(ctx, ts)
+	if err != nil {
+		t.Fatal("error setting offset by timestamp", err)
+	}
+
+	m, err := r.ReadMessage(context.Background())
+	if err != nil {
+		t.Fatal("error reading message", err)
+	}
+
+	if m.Offset != 10 {
+		t.Errorf("expected offset of 10, received offset %d", m.Offset)
 	}
 }
 
@@ -945,7 +987,7 @@ func TestReaderConsumerGroup(t *testing.T) {
 				Brokers:           []string{"localhost:9092"},
 				Topic:             topic,
 				GroupID:           groupID,
-				HeartbeatInterval: time.Second,
+				HeartbeatInterval: 2 * time.Second,
 				CommitInterval:    test.commitInterval,
 				RebalanceTimeout:  8 * time.Second,
 				RetentionTime:     time.Hour,
@@ -1450,7 +1492,43 @@ func TestCommitOffsetsWithRetry(t *testing.T) {
 	}
 }
 
+// Test that a reader won't continually rebalance when there are more consumers
+// than partitions in a group.
+// https://github.com/segmentio/kafka-go/issues/200
+func TestRebalanceTooManyConsumers(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	conf := ReaderConfig{
+		Brokers: []string{"localhost:9092"},
+		GroupID: makeGroupID(),
+		Topic:   makeTopic(),
+		MaxWait: time.Second,
+	}
+
+	// Create the first reader and wait for it to become the leader.
+	r1 := NewReader(conf)
+	prepareReader(t, ctx, r1, makeTestSequence(1)...)
+	r1.ReadMessage(ctx)
+	// Clear the stats from the first rebalance.
+	r1.Stats()
+
+	// Second reader should cause one rebalance for each r1 and r2.
+	r2 := NewReader(conf)
+
+	// Wait for rebalances.
+	time.Sleep(5 * time.Second)
+
+	// Before the fix, r2 would cause continuous rebalances,
+	// as it tried to handshake() repeatedly.
+	rebalances := r1.Stats().Rebalances + r2.Stats().Rebalances
+	if rebalances > 2 {
+		t.Errorf("unexpected rebalances to first reader, got %d", rebalances)
+
+	}
+}
 func TestAutoOffsetReset(t *testing.T) {
+
 	t.Parallel()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
