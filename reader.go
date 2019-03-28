@@ -495,7 +495,7 @@ func (r *Reader) fetchOffsets(conn *Conn, subs map[string][]int32) (map[int]int6
 				offset := pr.Offset
 				if offset < 0 {
 					// No offset stored
-					offset = FirstOffset
+					offset = r.config.AutoOffsetReset
 				}
 				offsetsByPartition[int(partition)] = offset
 			}
@@ -991,6 +991,15 @@ type ReaderConfig struct {
 	// ErrorLogger is the logger used to report errors. If nil, the reader falls
 	// back to using Logger instead.
 	ErrorLogger *log.Logger
+
+	// AutoOffsetReset decides what to do when there is no initial offset of if the current
+	// offset does not exist any more (e.g. because that data has been deleted).
+	//
+	// FirstOffset: reset the offset to the earliest offset.
+	// LastOffset:  reset the offset to the latest offset.
+	//
+	// Default: FirstOffset
+	AutoOffsetReset int64
 }
 
 // ReaderStats is a data structure returned by a call to Reader.Stats that exposes
@@ -1155,6 +1164,10 @@ func NewReader(config ReaderConfig) *Reader {
 
 	if config.QueueCapacity == 0 {
 		config.QueueCapacity = 100
+	}
+
+	if config.AutoOffsetReset != LastOffset {
+		config.AutoOffsetReset = FirstOffset
 	}
 
 	// when configured as a consumer group; stats should report a partition of -1
@@ -1624,18 +1637,19 @@ func (r *Reader) start(offsetsByPartition map[int]int64) {
 			defer join.Done()
 
 			(&reader{
-				dialer:      r.config.Dialer,
-				logger:      r.config.Logger,
-				errorLogger: r.config.ErrorLogger,
-				brokers:     r.config.Brokers,
-				topic:       r.config.Topic,
-				partition:   partition,
-				minBytes:    r.config.MinBytes,
-				maxBytes:    r.config.MaxBytes,
-				maxWait:     r.config.MaxWait,
-				version:     r.version,
-				msgs:        r.msgs,
-				stats:       r.stats,
+				dialer:          r.config.Dialer,
+				logger:          r.config.Logger,
+				errorLogger:     r.config.ErrorLogger,
+				brokers:         r.config.Brokers,
+				topic:           r.config.Topic,
+				partition:       partition,
+				minBytes:        r.config.MinBytes,
+				maxBytes:        r.config.MaxBytes,
+				maxWait:         r.config.MaxWait,
+				version:         r.version,
+				msgs:            r.msgs,
+				stats:           r.stats,
+				autoOffsetReset: r.config.AutoOffsetReset,
 			}).run(ctx, offset)
 		}(ctx, partition, offset, &r.join)
 	}
@@ -1645,18 +1659,19 @@ func (r *Reader) start(offsetsByPartition map[int]int64) {
 // used as an way to asynchronously fetch messages while the main program reads
 // them using the high level reader API.
 type reader struct {
-	dialer      *Dialer
-	logger      *log.Logger
-	errorLogger *log.Logger
-	brokers     []string
-	topic       string
-	partition   int
-	minBytes    int
-	maxBytes    int
-	maxWait     time.Duration
-	version     int64
-	msgs        chan<- readerMessage
-	stats       *readerStats
+	dialer          *Dialer
+	logger          *log.Logger
+	errorLogger     *log.Logger
+	brokers         []string
+	topic           string
+	partition       int
+	minBytes        int
+	maxBytes        int
+	maxWait         time.Duration
+	version         int64
+	msgs            chan<- readerMessage
+	stats           *readerStats
+	autoOffsetReset int64
 }
 
 type readerMessage struct {
@@ -1769,34 +1784,32 @@ func (r *reader) run(ctx context.Context, offset int64) {
 				continue
 
 			case OffsetOutOfRange:
-				first, last, err := r.readOffsets(conn)
+				// We've probably tried to read an offset that has been deleted,
+				// e.g. because the message exceeded the topic's retention policy.
+				// ReaderConfig.AutoOffsetReset controls where the reader seeks to.
 
+				before := offset
+
+				if r.autoOffsetReset == FirstOffset {
+					offset, err = conn.Seek(0, SeekStart)
+				} else {
+					offset, err = conn.Seek(0, SeekEnd)
+				}
 				if err != nil {
 					r.withErrorLogger(func(log *log.Logger) {
-						log.Printf("the kafka reader got an error while attempting to determine whether it was reading before the first offset or after the last offset of partition %d of %s: %s", r.partition, r.topic, err)
+						log.Printf("error while seeking to new offset: %v", err)
 					})
 					conn.Close()
 					break readLoop
 				}
 
-				switch {
-				case offset < first:
-					r.withErrorLogger(func(log *log.Logger) {
-						log.Printf("the kafka reader is reading before the first offset for partition %d of %s, skipping from offset %d to %d (%d messages)", r.partition, r.topic, offset, first, first-offset)
-					})
-					offset, errcount = first, 0
-					continue // retry immediately so we don't keep falling behind due to the backoff
+				r.withErrorLogger(func(log *log.Logger) {
+					log.Printf("the kafka reader is reading offset out of range for partition %d of %s, skipping from offset %d to %d (%d messages)", r.partition, r.topic, before, offset, offset-before)
+				})
 
-				case offset < last:
-					errcount = 0
-					continue // more messages have already become available, retry immediately
-
-				default:
-					// We may be reading past the last offset, will retry later.
-					r.withErrorLogger(func(log *log.Logger) {
-						log.Printf("the kafka reader is reading passed the last offset for partition %d of %s at offset %d", r.partition, r.topic, offset)
-					})
-				}
+				// set errcount = 0 so that we retry immediately.
+				errcount = 0
+				continue
 
 			case context.Canceled:
 				// Another reader has taken over, we can safely quit.

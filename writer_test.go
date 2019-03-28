@@ -47,6 +47,10 @@ func TestWriter(t *testing.T) {
 			scenario: "writing messsages with a small batch byte size",
 			function: testWriterSmallBatchBytes,
 		},
+		{
+			scenario: "writing messages that will error to test retries",
+			function: testWriterRetryErr,
+		},
 	}
 
 	for _, test := range tests {
@@ -354,7 +358,7 @@ func testWriterSmallBatchBytes(t *testing.T) {
 	w := newTestWriter(WriterConfig{
 		Topic:        topic,
 		BatchBytes:   25,
-		BatchTimeout: 50 * time.Millisecond,
+		BatchTimeout: 500 * time.Millisecond,
 		Balancer:     &RoundRobin{},
 	})
 	defer w.Close()
@@ -366,9 +370,9 @@ func testWriterSmallBatchBytes(t *testing.T) {
 		t.Error(err)
 		return
 	}
-	ws := w.Stats()
-	if ws.Writes != 2 {
-		t.Error("didn't batch messages; Writes: ", ws.Writes)
+
+	if w.Stats().Writes != 2 {
+		t.Error("didn't batch messages")
 		return
 	}
 	msgs, err := readPartition(topic, 0, offset)
@@ -389,4 +393,32 @@ func testWriterSmallBatchBytes(t *testing.T) {
 		}
 		t.Error("bad messages in partition", msgs)
 	}
+}
+
+func testWriterRetryErr(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	topic := makeTopic()
+	createTopic(t, topic, 1)
+
+	w := newTestWriter(WriterConfig{
+		Topic:       topic,
+		BatchSize:   1,
+		MaxAttempts: 1,
+		Retries:     5,
+	})
+	defer w.Close()
+
+	err := w.WriteMessages(ctx, []Message{
+		Message{Value: []byte("Hi"), Partition: 1},
+	}...)
+	if err == nil {
+		t.Error("expected error, got nothing")
+	}
+	stats := w.Stats()
+	if stats.Retries.Max != 5 {
+		t.Error("Expect retries to be equal to retry count")
+	}
+
 }

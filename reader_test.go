@@ -1524,5 +1524,77 @@ func TestRebalanceTooManyConsumers(t *testing.T) {
 	rebalances := r1.Stats().Rebalances + r2.Stats().Rebalances
 	if rebalances > 2 {
 		t.Errorf("unexpected rebalances to first reader, got %d", rebalances)
+
+	}
+}
+func TestAutoOffsetReset(t *testing.T) {
+
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	topic := makeTopic()
+	w := NewWriter(WriterConfig{
+		Brokers:   []string{"localhost:9092"},
+		Topic:     topic,
+		BatchSize: 1,
+	})
+
+	// Wait for topic leader election
+	time.Sleep(10 * time.Second)
+	// Write test data
+	msgs := make([]Message, 500)
+	err := w.WriteMessages(ctx, msgs...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+
+	// Expect default reader to read from first offset.
+	r := NewReader(ReaderConfig{
+		GroupID:  makeGroupID(),
+		Brokers:  []string{"localhost:9092"},
+		Topic:    topic,
+		MinBytes: 1,
+		MaxBytes: 100,
+		MaxWait:  100 * time.Millisecond,
+	})
+	defer r.Close()
+
+	msg, err := r.ReadMessage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if msg.Offset != 0 {
+		t.Error("expected to get first message")
+	}
+
+	// Expected AutoOffsetReset = LastOffset to read from last offset.
+	r2 := NewReader(ReaderConfig{
+		GroupID:         makeGroupID(),
+		Brokers:         []string{"localhost:9092"},
+		Topic:           topic,
+		MinBytes:        1,
+		MaxBytes:        100,
+		MaxWait:         100 * time.Millisecond,
+		AutoOffsetReset: LastOffset,
+	})
+	defer r2.Close()
+
+	// Write a single test message, the "last" message.
+	go func() {
+		time.Sleep(1 * time.Second)
+		prepareReader(t, ctx, r, Message{Value: []byte("last")})
+	}()
+
+	msg, err = r2.ReadMessage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(msg.Value) != "last" {
+		t.Errorf("expected last message. got offset %d", msg.Offset)
 	}
 }
