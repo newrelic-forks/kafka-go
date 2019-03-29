@@ -22,6 +22,7 @@ const (
 	MessageSizeTooLarge                Error = 10
 	StaleControllerEpoch               Error = 11
 	OffsetMetadataTooLarge             Error = 12
+	NetworkException                   Error = 13
 	GroupLoadInProgress                Error = 14
 	GroupCoordinatorNotAvailable       Error = 15
 	NotCoordinatorForGroup             Error = 16
@@ -85,6 +86,8 @@ const (
 	FencedLeaderEpoch                  Error = 74
 	UnknownLeaderEpoch                 Error = 75
 	UnsupportedCompressionType         Error = 76
+	OffsetNotAvailable                 Error = 78
+	PreferredLeaderNotAvailable        Error = 80
 )
 
 // Error satisfies the error interface.
@@ -106,6 +109,32 @@ func (e Error) Temporary() bool {
 		e == GroupLoadInProgress ||
 		e == GroupCoordinatorNotAvailable ||
 		e == RebalanceInProgress ||
+		e.Timeout()
+}
+
+// Retriable returns true if the error is one the "RETRIABLE" error codes from:
+// https://kafka.apache.org/protocol#protocol_error_codes
+func (e Error) Retriable() bool {
+	return e == InvalidMessage ||
+		e == UnknownTopicOrPartition ||
+		e == LeaderNotAvailable ||
+		e == NotLeaderForPartition ||
+		e == RequestTimedOut ||
+		e == NetworkException ||
+		e == GroupLoadInProgress ||
+		e == GroupCoordinatorNotAvailable ||
+		e == NotCoordinatorForGroup ||
+		e == NotEnoughReplicas ||
+		e == NotEnoughReplicasAfterAppend ||
+		e == NotController ||
+		e == KafkaStorageError ||
+		e == FetchSessionIDNotFound ||
+		e == InvalidFetchSessionEpoch ||
+		e == ListenerNotFound ||
+		e == FencedLeaderEpoch ||
+		e == UnknownLeaderEpoch ||
+		e == OffsetNotAvailable ||
+		e == PreferredLeaderNotAvailable ||
 		e.Timeout()
 }
 
@@ -138,6 +167,8 @@ func (e Error) Title() string {
 		return "Stale Controller Epoch"
 	case OffsetMetadataTooLarge:
 		return "Offset Metadata Too Large"
+	case NetworkException:
+		return "Network Exception"
 	case GroupLoadInProgress:
 		return "Group Load In Progress"
 	case GroupCoordinatorNotAvailable:
@@ -264,6 +295,10 @@ func (e Error) Title() string {
 		return "Unknown Leader Epoch"
 	case UnsupportedCompressionType:
 		return "Unsupported Compression Type"
+	case OffsetNotAvailable:
+		return "Offset Not Available"
+	case PreferredLeaderNotAvailable:
+		return "Preferred Leader not available"
 	}
 	return ""
 }
@@ -440,7 +475,12 @@ func isTemporary(err error) bool {
 	})
 	return ok && e.Temporary()
 }
-
+func isRetriable(err error) bool {
+	e, ok := err.(interface {
+		Retriable() bool
+	})
+	return ok && e.Retriable()
+}
 func silentEOF(err error) error {
 	if err == io.EOF {
 		err = nil

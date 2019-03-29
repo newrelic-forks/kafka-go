@@ -752,6 +752,7 @@ func (w *writer) write(conn *Conn, batch []Message, resch [](chan<- error)) (ret
 			if w.retries == attempts {
 				break
 			}
+
 			switch err {
 			case DuplicateSequenceNumber:
 				// we've moved beyond the batch but haven't noticed it. Just return success.
@@ -761,19 +762,22 @@ func (w *writer) write(conn *Conn, batch []Message, resch [](chan<- error)) (ret
 			case TopicAuthorizationFailed, ClusterAuthorizationFailed, GroupAuthorizationFailed:
 				err = fmt.Errorf("auth error writing messages to %s (partition %d): %s", w.topic, w.partition, err)
 				break
-
 			default:
-				attempts = attempts + 1
-				w.stats.retries.observe(int64(attempts))
-				err = fmt.Errorf("error writing messages to %s (partition %d): %s", w.topic, w.partition, err)
-				w.withErrorLogger(func(l *log.Logger) {
-					l.Printf("retrying batch due to potential transient error to %s (partition %d): %s",
-						w.topic, w.partition, err)
-				})
-				backoff(attempts, w.retryBackoffInterval, w.retryBackoffInterval)
-				conn.Close()
-				conn = nil
-				continue
+				if isRetriable(err) {
+					attempts = attempts + 1
+					w.stats.retries.observe(int64(attempts))
+					err = fmt.Errorf("error writing messages to %s (partition %d): %s", w.topic, w.partition, err)
+					w.withErrorLogger(func(l *log.Logger) {
+						l.Printf("retrying batch due to potential transient error to %s (partition %d): %s",
+							w.topic, w.partition, err)
+					})
+					backoff(attempts, w.retryBackoffInterval, w.retryBackoffInterval)
+					conn.Close()
+					conn = nil
+					continue
+				}
+				// This error is nor retriable or something speical, so just get outta here.
+				break
 			}
 
 		}
