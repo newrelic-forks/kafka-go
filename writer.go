@@ -728,22 +728,22 @@ func (w *writer) dial() (conn *Conn, err error) {
 }
 
 func (w *writer) write(conn *Conn, batch []Message, resch [](chan<- error)) (ret *Conn, err error) {
-	if conn == nil {
-		if conn, err = w.dial(); err != nil {
-			w.stats.errors.observe(1)
-			w.withErrorLogger(func(logger *log.Logger) {
-				logger.Printf("error dialing kafka brokers for topic %s (partition %d): %s", w.topic, w.partition, err)
-			})
-			for i, res := range resch {
-				res <- &writerError{msg: batch[i], err: err}
-			}
-			return
-		}
-	}
-
 	t0 := time.Now()
 	attempts := 0
 	for {
+		if conn == nil {
+			if conn, err = w.dial(); err != nil {
+				w.stats.errors.observe(1)
+				w.withErrorLogger(func(logger *log.Logger) {
+					logger.Printf("error dialing kafka brokers for topic %s (partition %d): %s", w.topic, w.partition, err)
+				})
+				for i, res := range resch {
+					res <- &writerError{msg: batch[i], err: err}
+				}
+				return
+			}
+		}
+
 		w.stats.writes.observe(1)
 		conn.SetWriteDeadline(time.Now().Add(w.writeTimeout))
 		if _, err = conn.WriteCompressedMessages(w.codec, batch...); err != nil {
@@ -771,6 +771,7 @@ func (w *writer) write(conn *Conn, batch []Message, resch [](chan<- error)) (ret
 						w.topic, w.partition, err)
 				})
 				backoff(attempts, w.retryBackoffInterval, w.retryBackoffInterval)
+				conn = nil
 				continue
 			}
 
