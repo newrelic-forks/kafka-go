@@ -766,7 +766,7 @@ func (w *writer) write(conn *Conn, batch []Message, resch [](chan<- error)) (ret
 				attempts = attempts + 1
 				w.stats.retries.observe(int64(attempts))
 				err = fmt.Errorf("error writing messages to %s (partition %d): %s", w.topic, w.partition, err)
-				w.withLogger(func(l *log.Logger) {
+				w.withErrorLogger(func(l *log.Logger) {
 					l.Printf("retrying batch due to potential transient error to %s (partition %d): %s",
 						w.topic, w.partition, err)
 				})

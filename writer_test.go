@@ -159,7 +159,6 @@ func testWriterMaxAttemptsErr(t *testing.T) {
 		},
 	})
 	defer w.Close()
-
 	if err := w.WriteMessages(ctx, Message{
 		Value: []byte("Hello World!"),
 	}); err == nil {
@@ -401,17 +400,22 @@ func testWriterRetryErr(t *testing.T) {
 
 	topic := makeTopic()
 	createTopic(t, topic, 1)
+	offset, err := readOffset(topic, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	w := newTestWriter(WriterConfig{
 		Topic:       topic,
-		BatchSize:   1,
+		BatchSize:   10,
 		MaxAttempts: 1,
 		Retries:     5,
 	})
 	defer w.Close()
 
-	err := w.WriteMessages(ctx, []Message{
-		Message{Value: []byte("Hi"), Partition: 1},
+	err = w.WriteMessages(ctx, []Message{
+		Message{Value: []byte("NetworkError"), Partition: 1},
+		Message{Value: []byte("CantFindMe")},
 	}...)
 	if err == nil {
 		t.Error("expected error, got nothing")
@@ -421,4 +425,24 @@ func testWriterRetryErr(t *testing.T) {
 		t.Error("Expect retries to be equal to retry count")
 	}
 
+	err = w.WriteMessages(ctx, []Message{
+		Message{Value: []byte("FindMe")},
+	}...)
+	if err != nil {
+		t.Error("expected  no  error, got error: ", err)
+	}
+	msgs, err := readPartition(topic, 0, offset)
+	if err != nil {
+		t.Error("expected  no  error, got error: ", err)
+	}
+	if len(msgs) != 1 {
+		t.Errorf("bad messages in partition %+v ", msgs)
+		return
+	}
+	for _, m := range msgs {
+		if string(m.Value) == "FindMe" {
+			continue
+		}
+		t.Error("didn't read any messages")
+	}
 }
