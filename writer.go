@@ -771,6 +771,7 @@ func (w *writer) write(conn *Conn, batch []Message, resch [](chan<- error)) (ret
 						w.topic, w.partition, err)
 				})
 				backoff(attempts, w.retryBackoffInterval, w.retryBackoffInterval)
+				conn.Close()
 				conn = nil
 				continue
 			}
