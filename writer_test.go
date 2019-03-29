@@ -429,11 +429,11 @@ func testWriterRetryErr(t *testing.T) {
 		Message{Value: []byte("FindMe")},
 	}...)
 	if err != nil {
-		t.Error("expected  no  error, got error: ", err)
+		t.Error("expected no error, got error: ", err)
 	}
 	msgs, err := readPartition(topic, 0, offset)
 	if err != nil {
-		t.Error("expected  no  error, got error: ", err)
+		t.Error("expected no error, got error: ", err)
 	}
 	if len(msgs) != 1 {
 		t.Errorf("bad messages in partition %+v ", msgs)
