@@ -102,19 +102,8 @@ func (e Error) Timeout() bool {
 
 // Temporary returns true if the operation that generated the error may succeed
 // if retried at a later time.
+// See https://kafka.apache.org/protocol#protocol_error_codes
 func (e Error) Temporary() bool {
-	return e == LeaderNotAvailable ||
-		e == BrokerNotAvailable ||
-		e == ReplicaNotAvailable ||
-		e == GroupLoadInProgress ||
-		e == GroupCoordinatorNotAvailable ||
-		e == RebalanceInProgress ||
-		e.Timeout()
-}
-
-// Retriable returns true if the error is one the "RETRIABLE" error codes from:
-// https://kafka.apache.org/protocol#protocol_error_codes
-func (e Error) Retriable() bool {
 	return e == InvalidMessage ||
 		e == UnknownTopicOrPartition ||
 		e == LeaderNotAvailable ||
@@ -474,12 +463,6 @@ func isTemporary(err error) bool {
 		Temporary() bool
 	})
 	return ok && e.Temporary()
-}
-func isRetriable(err error) bool {
-	e, ok := err.(interface {
-		Retriable() bool
-	})
-	return ok && e.Retriable()
 }
 func silentEOF(err error) error {
 	if err == io.EOF {

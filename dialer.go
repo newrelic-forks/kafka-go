@@ -185,6 +185,7 @@ func (d *Dialer) LookupPartition(ctx context.Context, network string, address st
 	case <-ctx.Done():
 		err = ctx.Err()
 	}
+
 	return prt, err
 }
 
@@ -248,7 +249,6 @@ func (d *Dialer) connect(ctx context.Context, network, address string, connCfg C
 	if err != nil {
 		return nil, err
 	}
-
 	conn := NewConnWith(c, connCfg)
 
 	if d.SASLMechanism != nil {
