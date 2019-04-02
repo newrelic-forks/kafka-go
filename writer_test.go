@@ -3,7 +3,6 @@ package kafka
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"math"
 	"strings"
@@ -480,7 +479,6 @@ func testIntWriterRetryErr(t *testing.T) {
 	_, err = w.write(gcnn, []Message{
 		Message{Value: []byte("BadBroker")},
 	}, errc)
-	fmt.Println(err)
 	if err == nil {
 		t.Error("expected error, got nothing")
 	}
