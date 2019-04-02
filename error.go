@@ -107,15 +107,12 @@ func (e Error) Temporary() bool {
 	return e == InvalidMessage ||
 		e == UnknownTopicOrPartition ||
 		e == LeaderNotAvailable ||
-		e == NotLeaderForPartition ||
 		e == RequestTimedOut ||
 		e == NetworkException ||
 		e == GroupLoadInProgress ||
 		e == GroupCoordinatorNotAvailable ||
-		e == NotCoordinatorForGroup ||
 		e == NotEnoughReplicas ||
 		e == NotEnoughReplicasAfterAppend ||
-		e == NotController ||
 		e == KafkaStorageError ||
 		e == FetchSessionIDNotFound ||
 		e == InvalidFetchSessionEpoch ||

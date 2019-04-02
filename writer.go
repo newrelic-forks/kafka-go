@@ -729,13 +729,19 @@ func shouldRetry(err error, retries, attempts int) bool {
 		return false
 	}
 	//Retry Temporary Kafka errors and all network errors
-	_, ok := err.(net.Error)
-	if isTemporary(err) || ok {
+	if isTemporary(err) || needsReconnect(err) {
 		return true
 	}
 	return false
 }
 
+func needsReconnect(err error) bool {
+	_, ok := err.(net.Error)
+	if ok || err == NotLeaderForPartition {
+		return true
+	}
+	return false
+}
 func (w *writer) write(conn *Conn, batch []Message, resch [](chan<- error)) (ret *Conn, err error) {
 	t0 := time.Now()
 	attempts := 0
@@ -779,10 +785,12 @@ func (w *writer) write(conn *Conn, batch []Message, resch [](chan<- error)) (ret
 					l.Printf("retrying batch due to potential transient error to %s (partition %d): %s", w.topic, w.partition, err)
 				})
 				backoff(attempts, w.retryBackoffInterval, w.retryBackoffInterval)
-				if conn != nil {
-					conn.Close()
+				if needsReconnect(err) {
+					if conn != nil {
+						conn.Close()
+					}
+					conn = nil
 				}
-				conn = nil
 				continue
 			}
 			err = fmt.Errorf("error writing messages to %s (partition %d): %s", w.topic, w.partition, err)
