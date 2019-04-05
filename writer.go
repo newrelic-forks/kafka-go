@@ -724,8 +724,8 @@ func (w *writer) dial() (conn *Conn, err error) {
 	return
 }
 
-func shouldRetry(err error, retries, attempts int) bool {
-	if retries == attempts {
+func shouldRetry(err error, maxRetries, attempts int) bool {
+	if attempts >= maxRetries {
 		return false
 	}
 	//Retry Temporary Kafka errors and all network errors
