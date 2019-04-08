@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"math/rand"
+	"net"
 	"sort"
 	"sync"
 	"time"
@@ -330,7 +331,6 @@ func (w *Writer) WriteMessages(ctx context.Context, msgs ...Message) error {
 				return ctx.Err()
 			}
 		}
-
 		w.mutex.RUnlock()
 
 		if w.config.Async {
@@ -468,7 +468,6 @@ func (w *Writer) run() {
 				for _, partition := range diffp(newPartitions, oldPartitions) {
 					writers[partition] = w.open(partition)
 				}
-
 				partitions = newPartitions
 			}
 		}
@@ -481,7 +480,6 @@ func (w *Writer) run() {
 				}
 				return
 			}
-
 			if len(partitions) != 0 {
 				selectedPartition := w.config.Balancer.Balance(wm.msg, partitions...)
 				writers[selectedPartition].messages() <- wm
@@ -490,7 +488,6 @@ func (w *Writer) run() {
 				if err == nil {
 					err = fmt.Errorf("failed to find any partitions for topic %s", w.config.Topic)
 				}
-
 				wm.res <- &writerError{msg: wm.msg, err: err}
 			}
 
@@ -727,53 +724,77 @@ func (w *writer) dial() (conn *Conn, err error) {
 	return
 }
 
-func (w *writer) write(conn *Conn, batch []Message, resch [](chan<- error)) (ret *Conn, err error) {
-	if conn == nil {
-		if conn, err = w.dial(); err != nil {
-			w.stats.errors.observe(1)
-			w.withErrorLogger(func(logger *log.Logger) {
-				logger.Printf("error dialing kafka brokers for topic %s (partition %d): %s", w.topic, w.partition, err)
-			})
-			for i, res := range resch {
-				res <- &writerError{msg: batch[i], err: err}
-			}
-			return
-		}
+func shouldRetry(err error, maxRetries, attempts int) bool {
+	if attempts >= maxRetries {
+		return false
 	}
+	//Retry Temporary Kafka errors and all network errors
+	if isTemporary(err) || needsReconnect(err) {
+		return true
+	}
+	return false
+}
 
+func needsReconnect(err error) bool {
+	_, ok := err.(net.Error)
+	if ok || err == NotLeaderForPartition {
+		return true
+	}
+	return false
+}
+func (w *writer) write(conn *Conn, batch []Message, resch [](chan<- error)) (ret *Conn, err error) {
 	t0 := time.Now()
 	attempts := 0
 	for {
+		if conn == nil {
+			if conn, err = w.dial(); err != nil {
+				w.stats.errors.observe(1)
+				w.withErrorLogger(func(logger *log.Logger) {
+					logger.Printf("error dialing kafka brokers for topic %s (partition %d): %s", w.topic, w.partition, err)
+				})
+				if shouldRetry(err, w.retries, attempts) {
+					attempts = attempts + 1
+					w.stats.retries.observe(int64(attempts))
+					backoff(attempts, w.retryBackoffInterval, w.retryBackoffInterval)
+					if conn != nil {
+						conn.Close()
+					}
+					conn = nil
+					continue
+				}
+				for i, res := range resch {
+					res <- &writerError{msg: batch[i], err: err}
+				}
+				return
+			}
+		}
 		w.stats.writes.observe(1)
 		conn.SetWriteDeadline(time.Now().Add(w.writeTimeout))
 		if _, err = conn.WriteCompressedMessages(w.codec, batch...); err != nil {
-			w.stats.errors.observe(1)
-			//Check if we've retried the correct amount of times.
-			if w.retries == attempts {
-				break
-			}
-			switch err {
-			case DuplicateSequenceNumber:
-				// we've moved beyond the batch but haven't noticed it. Just return success.
-				// See https://github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java#L617
+			//If we get this error, just leave now as this message will never make it.
+			// https://github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java#L618
+			if err == DuplicateSequenceNumber {
 				err = nil
 				break
-			case TopicAuthorizationFailed, ClusterAuthorizationFailed, GroupAuthorizationFailed:
-				err = fmt.Errorf("auth error writing messages to %s (partition %d): %s", w.topic, w.partition, err)
-				break
-
-			default:
+			}
+			w.stats.errors.observe(1)
+			if shouldRetry(err, w.retries, attempts) {
 				attempts = attempts + 1
 				w.stats.retries.observe(int64(attempts))
-				err = fmt.Errorf("error writing messages to %s (partition %d): %s", w.topic, w.partition, err)
-				w.withLogger(func(l *log.Logger) {
-					l.Printf("retrying batch due to potential transient error to %s (partition %d): %s",
-						w.topic, w.partition, err)
+				w.withErrorLogger(func(l *log.Logger) {
+					l.Printf("retrying batch due to potential transient error to %s (partition %d): %s", w.topic, w.partition, err)
 				})
 				backoff(attempts, w.retryBackoffInterval, w.retryBackoffInterval)
+				if needsReconnect(err) {
+					if conn != nil {
+						conn.Close()
+					}
+					conn = nil
+				}
 				continue
 			}
-
+			err = fmt.Errorf("error writing messages to %s (partition %d): %s", w.topic, w.partition, err)
+			break
 		}
 		//Successful send
 		break
