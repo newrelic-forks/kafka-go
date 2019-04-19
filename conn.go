@@ -759,7 +759,7 @@ func (c *Conn) ReadBatchWith(cfg ReadBatchConfig) *Batch {
 	}
 
 	var msgs *messageSetReader
-	if err == nil {
+	if err == nil > remain > 0 {
 		msgs, err = newMessageSetReader(&c.rbuf, remain)
 	}
 	if err == errShortRead {
