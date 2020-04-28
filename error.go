@@ -6,6 +6,7 @@ import (
 )
 
 // Error represents the different error codes that may be returned by kafka.
+// https://kafka.apache.org/protocol#protocol_error_codes
 type Error int
 
 const (
@@ -86,8 +87,12 @@ const (
 	FencedLeaderEpoch                  Error = 74
 	UnknownLeaderEpoch                 Error = 75
 	UnsupportedCompressionType         Error = 76
+	StaleBrokerEpoch                   Error = 77
 	OffsetNotAvailable                 Error = 78
+	MemberIDRequired                   Error = 79
 	PreferredLeaderNotAvailable        Error = 80
+	GroupMaxSizeReached                Error = 81
+	FencedInstanceID                   Error = 82
 )
 
 // Error satisfies the error interface.
@@ -102,26 +107,35 @@ func (e Error) Timeout() bool {
 
 // Temporary returns true if the operation that generated the error may succeed
 // if retried at a later time.
-// See https://kafka.apache.org/protocol#protocol_error_codes
+// Kafka error documentation specifies these as "retriable"
+// https://kafka.apache.org/protocol#protocol_error_codes
 func (e Error) Temporary() bool {
-	return e == InvalidMessage ||
-		e == UnknownTopicOrPartition ||
-		e == LeaderNotAvailable ||
-		e == RequestTimedOut ||
-		e == NetworkException ||
-		e == GroupLoadInProgress ||
-		e == GroupCoordinatorNotAvailable ||
-		e == NotEnoughReplicas ||
-		e == NotEnoughReplicasAfterAppend ||
-		e == KafkaStorageError ||
-		e == FetchSessionIDNotFound ||
-		e == InvalidFetchSessionEpoch ||
-		e == ListenerNotFound ||
-		e == FencedLeaderEpoch ||
-		e == UnknownLeaderEpoch ||
-		e == OffsetNotAvailable ||
-		e == PreferredLeaderNotAvailable ||
-		e.Timeout()
+	switch e {
+	case InvalidMessage,
+		UnknownTopicOrPartition,
+		LeaderNotAvailable,
+		NotLeaderForPartition,
+		RequestTimedOut,
+		NetworkException,
+		GroupLoadInProgress,
+		GroupCoordinatorNotAvailable,
+		NotCoordinatorForGroup,
+		NotEnoughReplicas,
+		NotEnoughReplicasAfterAppend,
+		NotController,
+		KafkaStorageError,
+		FetchSessionIDNotFound,
+		InvalidFetchSessionEpoch,
+		ListenerNotFound,
+		FencedLeaderEpoch,
+		UnknownLeaderEpoch,
+		OffsetNotAvailable,
+		PreferredLeaderNotAvailable:
+		return true
+
+	default:
+		return false
+	}
 }
 
 // Title returns a human readable title for the error.
@@ -153,8 +167,6 @@ func (e Error) Title() string {
 		return "Stale Controller Epoch"
 	case OffsetMetadataTooLarge:
 		return "Offset Metadata Too Large"
-	case NetworkException:
-		return "Network Exception"
 	case GroupLoadInProgress:
 		return "Group Load In Progress"
 	case GroupCoordinatorNotAvailable:
@@ -281,10 +293,6 @@ func (e Error) Title() string {
 		return "Unknown Leader Epoch"
 	case UnsupportedCompressionType:
 		return "Unsupported Compression Type"
-	case OffsetNotAvailable:
-		return "Offset Not Available"
-	case PreferredLeaderNotAvailable:
-		return "Preferred Leader not available"
 	}
 	return ""
 }
@@ -461,6 +469,7 @@ func isTemporary(err error) bool {
 	})
 	return ok && e.Temporary()
 }
+
 func silentEOF(err error) error {
 	if err == io.EOF {
 		err = nil
@@ -482,4 +491,13 @@ func coalesceErrors(errs ...error) error {
 		}
 	}
 	return nil
+}
+
+type MessageTooLargeError struct {
+	Message   Message
+	Remaining []Message
+}
+
+func (e MessageTooLargeError) Error() string {
+	return MessageSizeTooLarge.Error()
 }

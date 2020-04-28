@@ -68,6 +68,12 @@ type Dialer struct {
 	// SASLMechanism configures the Dialer to use SASL authentication.  If nil,
 	// no authentication will be performed.
 	SASLMechanism sasl.Mechanism
+
+	// The transactional id to use for transactional delivery. Idempotent
+	// deliver should be enabled if transactional id is configured.
+	// For more details look at transactional.id description here: http://kafka.apache.org/documentation.html#producerconfigs
+	// Empty string means that the connection will be non-transactional.
+	TransactionalID string
 }
 
 // Dial connects to the address on the named network.
@@ -89,19 +95,15 @@ func (d *Dialer) Dial(network string, address string) (*Conn, error) {
 // 1 minute, the connect to each single address will be given 15 seconds to
 // complete before trying the next one.
 func (d *Dialer) DialContext(ctx context.Context, network string, address string) (*Conn, error) {
-	if d.Timeout != 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, d.Timeout)
-		defer cancel()
-	}
-
-	if !d.Deadline.IsZero() {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithDeadline(ctx, d.Deadline)
-		defer cancel()
-	}
-
-	return d.connect(ctx, network, address, ConnConfig{ClientID: d.ClientID})
+	return d.connect(
+		ctx,
+		network,
+		address,
+		ConnConfig{
+			ClientID:        d.ClientID,
+			TransactionalID: d.TransactionalID,
+		},
+	)
 }
 
 // DialLeader opens a connection to the leader of the partition for a given
@@ -125,9 +127,10 @@ func (d *Dialer) DialLeader(ctx context.Context, network string, address string,
 // functions LookupPartition or LookupPartitions.
 func (d *Dialer) DialPartition(ctx context.Context, network string, address string, partition Partition) (*Conn, error) {
 	return d.connect(ctx, network, net.JoinHostPort(partition.Leader.Host, strconv.Itoa(partition.Leader.Port)), ConnConfig{
-		ClientID:  d.ClientID,
-		Topic:     partition.Topic,
-		Partition: partition.ID,
+		ClientID:        d.ClientID,
+		Topic:           partition.Topic,
+		Partition:       partition.ID,
+		TransactionalID: d.TransactionalID,
 	})
 }
 
@@ -185,7 +188,6 @@ func (d *Dialer) LookupPartition(ctx context.Context, network string, address st
 	case <-ctx.Done():
 		err = ctx.Err()
 	}
-
 	return prt, err
 }
 
@@ -244,11 +246,23 @@ func (d *Dialer) connectTLS(ctx context.Context, conn net.Conn, config *tls.Conf
 // connect opens a socket connection to the broker, wraps it to create a
 // kafka connection, and performs SASL authentication if configured to do so.
 func (d *Dialer) connect(ctx context.Context, network, address string, connCfg ConnConfig) (*Conn, error) {
+	if d.Timeout != 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, d.Timeout)
+		defer cancel()
+	}
+
+	if !d.Deadline.IsZero() {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, d.Deadline)
+		defer cancel()
+	}
 
 	c, err := d.dialContext(ctx, network, address)
 	if err != nil {
 		return nil, err
 	}
+
 	conn := NewConnWith(c, connCfg)
 
 	if d.SASLMechanism != nil {
@@ -268,17 +282,16 @@ func (d *Dialer) connect(ctx context.Context, network, address string, connCfg C
 // In case of error, this function *does not* close the connection.  That is the
 // responsibility of the caller.
 func (d *Dialer) authenticateSASL(ctx context.Context, conn *Conn) error {
-	mech, state, err := d.SASLMechanism.Start(ctx)
-	if err != nil {
+	if err := conn.saslHandshake(d.SASLMechanism.Name()); err != nil {
 		return err
 	}
-	err = conn.saslHandshake(mech)
+
+	sess, state, err := d.SASLMechanism.Start(ctx)
 	if err != nil {
 		return err
 	}
 
-	var completed bool
-	for !completed {
+	for completed := false; !completed; {
 		challenge, err := conn.saslAuthenticate(state)
 		switch err {
 		case nil:
@@ -291,7 +304,7 @@ func (d *Dialer) authenticateSASL(ctx context.Context, conn *Conn) error {
 			return err
 		}
 
-		completed, state, err = d.SASLMechanism.Next(ctx, challenge)
+		completed, state, err = sess.Next(ctx, challenge)
 		if err != nil {
 			return err
 		}

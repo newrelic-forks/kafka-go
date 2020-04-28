@@ -43,17 +43,52 @@ func readInt64(r *bufio.Reader, sz int, v *int64) (int, error) {
 }
 
 func readVarInt(r *bufio.Reader, sz int, v *int64) (remain int, err error) {
-	l := 0
-	remain = sz
-	for done := false; !done && err == nil; {
-		remain, err = peekRead(r, remain, 1, func(b []byte) {
-			done = b[0]&0x80 == 0
-			*v |= int64(b[0]&0x7f) << uint(l*7)
-		})
-		l++
+	// Optimistically assume that most of the time, there will be data buffered
+	// in the reader. If this is not the case, the buffer will be refilled after
+	// consuming zero bytes from the input.
+	input, _ := r.Peek(r.Buffered())
+	x := uint64(0)
+	s := uint(0)
+
+	for {
+		if len(input) > sz {
+			input = input[:sz]
+		}
+
+		for i, b := range input {
+			if b < 0x80 {
+				x |= uint64(b) << s
+				*v = int64(x>>1) ^ -(int64(x) & 1)
+				n, err := r.Discard(i + 1)
+				return sz - n, err
+			}
+
+			x |= uint64(b&0x7f) << s
+			s += 7
+		}
+
+		// Make room in the input buffer to load more data from the underlying
+		// stream. The x and s variables are left untouched, ensuring that the
+		// varint decoding can continue on the next loop iteration.
+		n, _ := r.Discard(len(input))
+		sz -= n
+		if sz == 0 {
+			return 0, errShortRead
+		}
+
+		// Fill the buffer: ask for one more byte, but in practice the reader
+		// will load way more from the underlying stream.
+		if _, err := r.Peek(1); err != nil {
+			if err == io.EOF {
+				err = errShortRead
+			}
+			return sz, err
+		}
+
+		// Grab as many bytes as possible from the buffer, then go on to the
+		// next loop iteration which is going to consume it.
+		input, _ = r.Peek(r.Buffered())
 	}
-	*v = (*v >> 1) ^ -(*v & 1)
-	return
 }
 
 func readBool(r *bufio.Reader, sz int, v *bool) (int, error) {
@@ -385,6 +420,110 @@ func readFetchResponseHeaderV5(r *bufio.Reader, size int) (throttle int32, water
 	var abortedTransactions []AbortedTransaction
 
 	if remain, err = readInt32(r, size, &throttle); err != nil {
+		return
+	}
+
+	if remain, err = readInt32(r, remain, &n); err != nil {
+		return
+	}
+
+	// This error should never trigger, unless there's a bug in the kafka client
+	// or server.
+	if n != 1 {
+		err = fmt.Errorf("1 kafka topic was expected in the fetch response but the client received %d", n)
+		return
+	}
+
+	// We ignore the topic name because we've requests messages for a single
+	// topic, unless there's a bug in the kafka server we will have received
+	// the name of the topic that we requested.
+	if remain, err = discardString(r, remain); err != nil {
+		return
+	}
+
+	if remain, err = readInt32(r, remain, &n); err != nil {
+		return
+	}
+
+	// This error should never trigger, unless there's a bug in the kafka client
+	// or server.
+	if n != 1 {
+		err = fmt.Errorf("1 kafka partition was expected in the fetch response but the client received %d", n)
+		return
+	}
+
+	if remain, err = read(r, remain, &p); err != nil {
+		return
+	}
+
+	var abortedTransactionLen int
+	if remain, err = readArrayLen(r, remain, &abortedTransactionLen); err != nil {
+		return
+	}
+
+	if abortedTransactionLen == -1 {
+		abortedTransactions = nil
+	} else {
+		abortedTransactions = make([]AbortedTransaction, abortedTransactionLen)
+		for i := 0; i < abortedTransactionLen; i++ {
+			if remain, err = read(r, remain, &abortedTransactions[i]); err != nil {
+				return
+			}
+		}
+	}
+
+	if p.ErrorCode != 0 {
+		err = Error(p.ErrorCode)
+		return
+	}
+
+	remain, err = readInt32(r, remain, &messageSetSize)
+	if err != nil {
+		return
+	}
+
+	// This error should never trigger, unless there's a bug in the kafka client
+	// or server.
+	if remain != int(messageSetSize) {
+		err = fmt.Errorf("the size of the message set in a fetch response doesn't match the number of remaining bytes (message set size = %d, remaining bytes = %d)", messageSetSize, remain)
+		return
+	}
+
+	watermark = p.HighwaterMarkOffset
+	return
+
+}
+
+func readFetchResponseHeaderV10(r *bufio.Reader, size int) (throttle int32, watermark int64, remain int, err error) {
+	var n int32
+	var errorCode int16
+	type AbortedTransaction struct {
+		ProducerId  int64
+		FirstOffset int64
+	}
+	var p struct {
+		Partition           int32
+		ErrorCode           int16
+		HighwaterMarkOffset int64
+		LastStableOffset    int64
+		LogStartOffset      int64
+	}
+	var messageSetSize int32
+	var abortedTransactions []AbortedTransaction
+
+	if remain, err = readInt32(r, size, &throttle); err != nil {
+		return
+	}
+
+	if remain, err = readInt16(r, remain, &errorCode); err != nil {
+		return
+	}
+	if errorCode != 0 {
+		err = Error(errorCode)
+		return
+	}
+
+	if remain, err = discardInt32(r, remain); err != nil {
 		return
 	}
 
