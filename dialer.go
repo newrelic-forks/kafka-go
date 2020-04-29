@@ -361,7 +361,7 @@ func (d *Dialer) dialContext(ctx context.Context, network string, address string
 
 // DefaultDialer is the default dialer used when none is specified.
 var DefaultDialer = &Dialer{
-	Timeout:   10 * time.Second,
+	Timeout:   1 * time.Second,
 	DualStack: true,
 }
 

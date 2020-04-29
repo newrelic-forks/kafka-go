@@ -59,6 +59,8 @@ type Reader struct {
 	lag     int64
 	closed  bool
 
+	runError chan error
+
 	// reader stats are all made of atomic values, no need for synchronization.
 	once  uint32
 	stctx context.Context
@@ -253,8 +255,15 @@ func (r *Reader) run(cg *ConsumerGroup) {
 	})
 
 	for {
-		gen, err := cg.Next(r.stctx)
-		if err != nil {
+		// Limit the number of attempts at waiting for the next
+		// consumer generation.
+		var err error
+		var gen *Generation
+		for attempt := 1; attempt <= r.config.MaxAttempts; attempt++ {
+			gen, err = cg.Next(r.stctx)
+			if err == nil {
+				break
+			}
 			if err == r.stctx.Err() {
 				return
 			}
@@ -262,6 +271,17 @@ func (r *Reader) run(cg *ConsumerGroup) {
 			r.withErrorLogger(func(l Logger) {
 				l.Printf(err.Error())
 			})
+			// Continue with next attempt...
+		}
+		if err != nil {
+			// All attempts have failed.
+			select {
+			case r.runError <- err:
+				// If somebody's receiving on the runError, let
+				// them know the error occurred.
+			default:
+				// Otherwise, don't block to allow healing.
+			}
 			continue
 		}
 
@@ -622,6 +642,7 @@ func NewReader(config ReaderConfig) *Reader {
 
 	if r.useConsumerGroup() {
 		r.done = make(chan struct{})
+		r.runError = make(chan error)
 		cg, err := NewConsumerGroup(ConsumerGroupConfig{
 			ID:                     r.config.GroupID,
 			Brokers:                r.config.Brokers,
@@ -725,6 +746,8 @@ func (r *Reader) FetchMessage(ctx context.Context) (Message, error) {
 		select {
 		case <-ctx.Done():
 			return Message{}, ctx.Err()
+		case err := <-r.runError:
+			return Message{}, err
 
 		case m, ok := <-r.msgs:
 			if !ok {
@@ -1196,7 +1219,7 @@ func (r *reader) run(ctx context.Context, offset int64) {
 				// block relies on the batch repackaging real io.EOF errors as
 				// io.UnexpectedEOF.  otherwise, we would end up swallowing real
 				// errors here.
-				errcount = 0
+				break readLoop
 			case UnknownTopicOrPartition:
 				r.withErrorLogger(func(log Logger) {
 					log.Printf("failed to read from current broker for partition %d of %s at offset %d, topic or parition not found on this broker, %v", r.partition, r.topic, offset, r.brokers)
@@ -1359,7 +1382,7 @@ func (r *reader) read(ctx context.Context, offset int64, conn *Conn) (int64, err
 	var size int64
 	var bytes int64
 
-	const safetyTimeout = 10 * time.Second
+	const safetyTimeout = 2 * time.Second
 	deadline := time.Now().Add(safetyTimeout)
 	conn.SetReadDeadline(deadline)
 
@@ -1401,7 +1424,7 @@ func (r *reader) read(ctx context.Context, offset int64, conn *Conn) (int64, err
 }
 
 func (r *reader) readOffsets(conn *Conn) (first, last int64, err error) {
-	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	conn.SetDeadline(time.Now().Add(1 * time.Second))
 	return conn.ReadOffsets()
 }
 
