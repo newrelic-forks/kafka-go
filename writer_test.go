@@ -58,26 +58,6 @@ func TestWriter(t *testing.T) {
 	}
 }
 
-func TestIntWriter(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		scenario string
-		function func(*testing.T)
-	}{
-		{
-			scenario: "writing messages that will error to test retries",
-			function: testIntWriterRetryErr,
-		},
-	}
-	for _, test := range tests {
-		testFunc := test.function
-		t.Run(test.scenario, func(t *testing.T) {
-			t.Parallel()
-			testFunc(t)
-		})
-	}
-}
-
 func newTestWriter(config WriterConfig) *Writer {
 	if len(config.Brokers) == 0 {
 		config.Brokers = []string{"localhost:9092"}
@@ -140,6 +120,26 @@ func testWriterRoundRobin1(t *testing.T) {
 	}
 }
 
+func TestValidateWriter(t *testing.T) {
+	tests := []struct {
+		config       WriterConfig
+		errorOccured bool
+	}{
+		{config: WriterConfig{}, errorOccured: true},
+		{config: WriterConfig{Brokers: []string{"broker1", "broker2"}}, errorOccured: true},
+		{config: WriterConfig{Brokers: []string{"broker1"}, Topic: "topic1"}, errorOccured: false},
+	}
+	for _, test := range tests {
+		err := test.config.Validate()
+		if test.errorOccured && err == nil {
+			t.Fail()
+		}
+		if !test.errorOccured && err != nil {
+			t.Fail()
+		}
+	}
+}
+
 type fakeWriter struct{}
 
 func (f *fakeWriter) messages() chan<- writerMessage {
@@ -162,9 +162,8 @@ func (f *fakeWriter) close() {
 }
 
 func testWriterMaxAttemptsErr(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	topic := makeTopic()
+	const topic = "test-writer-2"
+
 	createTopic(t, topic, 1)
 	w := newTestWriter(WriterConfig{
 		Topic:       topic,
@@ -175,7 +174,8 @@ func testWriterMaxAttemptsErr(t *testing.T) {
 		},
 	})
 	defer w.Close()
-	if err := w.WriteMessages(ctx, Message{
+
+	if err := w.WriteMessages(context.Background(), Message{
 		Value: []byte("Hello World!"),
 	}); err == nil {
 		t.Error("expected error")
@@ -189,33 +189,55 @@ func testWriterMaxAttemptsErr(t *testing.T) {
 }
 
 func testWriterMaxBytes(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	topic := makeTopic()
+
 	createTopic(t, topic, 1)
 	w := newTestWriter(WriterConfig{
 		Topic:      topic,
-		BatchSize:  1,
 		BatchBytes: 25,
 	})
 	defer w.Close()
 
-	if err := w.WriteMessages(ctx, Message{
+	if err := w.WriteMessages(context.Background(), Message{
 		Value: []byte("Hi"),
 	}); err != nil {
 		t.Error(err)
 		return
 	}
-	if err := w.WriteMessages(ctx, Message{
-		Value: []byte("Hello World!"),
-	}); err != nil {
-		t.Error("got error when not expecting one: ", err)
+
+	firstMsg := []byte("Hello World!")
+	secondMsg := []byte("LeftOver!")
+	msgs := []Message{
+		{
+			Value: firstMsg,
+		},
+		{
+			Value: secondMsg,
+		},
+	}
+	if err := w.WriteMessages(context.Background(), msgs...); err == nil {
+		t.Error("expected error")
 		return
+	} else if err != nil {
+		switch e := err.(type) {
+		case MessageTooLargeError:
+			if string(e.Message.Value) != string(firstMsg) {
+				t.Errorf("unxpected returned message. Expected: %s, Got %s", firstMsg, e.Message.Value)
+				return
+			}
+			if len(e.Remaining) != 1 {
+				t.Error("expected remaining errors; found none")
+				return
+			}
+			if string(e.Remaining[0].Value) != string(secondMsg) {
+				t.Errorf("unxpected returned message. Expected: %s, Got %s", secondMsg, e.Message.Value)
+				return
+			}
+		default:
+			t.Errorf("unexpected error: %s", err)
+			return
+		}
 	}
-	if w.Stats().Errors < 1 {
-		t.Error("exepecting error count to be at least 1 due to max message bytes")
-	}
-	return
 }
 
 func readOffset(topic string, partition int) (offset int64, err error) {
@@ -371,11 +393,10 @@ func testWriterSmallBatchBytes(t *testing.T) {
 	}
 
 	w := newTestWriter(WriterConfig{
-		Topic:             topic,
-		BatchBytes:        25,
-		BatchTimeout:      500 * time.Millisecond,
-		Balancer:          &RoundRobin{},
-		RebalanceInterval: 1 * time.Second,
+		Topic:        topic,
+		BatchBytes:   25,
+		BatchTimeout: 50 * time.Millisecond,
+		Balancer:     &RoundRobin{},
 	})
 	defer w.Close()
 
@@ -386,9 +407,9 @@ func testWriterSmallBatchBytes(t *testing.T) {
 		t.Error(err)
 		return
 	}
-
-	if w.Stats().Writes != 2 {
-		t.Error("didn't batch messages")
+	ws := w.Stats()
+	if ws.Writes != 2 {
+		t.Error("didn't batch messages; Writes: ", ws.Writes)
 		return
 	}
 	msgs, err := readPartition(topic, 0, offset)
@@ -408,82 +429,5 @@ func testWriterSmallBatchBytes(t *testing.T) {
 			continue
 		}
 		t.Error("bad messages in partition", msgs)
-	}
-}
-
-func testIntWriterRetryErr(t *testing.T) {
-	//ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	//defer cancel()
-
-	topic := makeTopic()
-	createTopic(t, topic, 1)
-	offset, err := readOffset(topic, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	stats := &writerStats{}
-	w := newWriter(1, WriterConfig{
-		Topic: topic,
-		//Give it a bad broker so we can test network failures
-		Brokers:      []string{"localhost:9099"},
-		BatchSize:    10,
-		MaxAttempts:  1,
-		Retries:      5,
-		Dialer:       DefaultDialer,
-		WriteTimeout: 10 * time.Second,
-	}, stats)
-	w.partition = 0
-	defer w.close()
-	errc := make([](chan<- error), 0, 200)
-
-	failedBatch := []Message{
-		Message{Value: []byte("NetworkError")},
-		Message{Value: []byte("CantFindMe")},
-	}
-
-	_, err = w.write(nil, failedBatch, errc)
-	if err == nil {
-		t.Error("expected error, got nothing")
-	}
-	ssnap := stats.retries.snapshot()
-	if ssnap.Max != 5 {
-		t.Error("Expect retries to be equal to retry count")
-	}
-
-	//First We Tested Bad, now we test a good connection.
-	// We'll use that good connection at the end to create
-	// a new nother bad test.
-	w.brokers = []string{"localhost:9092"}
-	gcnn, err := w.write(nil, []Message{
-		Message{Value: []byte("FindMe")},
-	}, errc)
-	if err != nil {
-		t.Error("expected no error, got error: ", err)
-	}
-	msgs, err := readPartition(topic, 0, offset)
-	if err != nil {
-		t.Error("expected no error, got error: ", err)
-	}
-	if len(msgs) != 1 {
-		t.Errorf("bad messages in partition %+v ", msgs)
-		return
-	}
-	for _, m := range msgs {
-		if string(m.Value) == "FindMe" {
-			continue
-		}
-		t.Error("didn't read any messages")
-	}
-
-	w.writeTimeout = 0 * time.Second
-	_, err = w.write(gcnn, []Message{
-		Message{Value: []byte("BadBroker")},
-	}, errc)
-	if err == nil {
-		t.Error("expected error, got nothing")
-	}
-	ssnap = stats.retries.snapshot()
-	if ssnap.Max != 5 {
-		t.Error("Expect retries to be equal to retry count")
 	}
 }

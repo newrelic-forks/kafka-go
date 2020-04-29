@@ -1,6 +1,7 @@
 package kafka
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -149,6 +150,11 @@ func TestConn(t *testing.T) {
 		{
 			scenario: "ensure the connection can seek to a random offset",
 			function: testConnSeekRandomOffset,
+		},
+
+		{
+			scenario: "unchecked seeks allow the connection to be positionned outside the boundaries of the partition",
+			function: testConnSeekDontCheck,
 		},
 
 		{
@@ -438,6 +444,27 @@ func testConnSeekRandomOffset(t *testing.T, conn *Conn) {
 	}
 }
 
+func testConnSeekDontCheck(t *testing.T, conn *Conn) {
+	for i := 0; i != 10; i++ {
+		if _, err := conn.Write([]byte(strconv.Itoa(i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	offset, err := conn.Seek(42, SeekAbsolute|SeekDontCheck)
+	if err != nil {
+		t.Error(err)
+	}
+
+	if offset != 42 {
+		t.Error("bad offset:", offset)
+	}
+
+	if _, err := conn.ReadMessage(1024); err != OffsetOutOfRange {
+		t.Error("unexpected error:", err)
+	}
+}
+
 func testConnWriteReadSequentially(t *testing.T, conn *Conn) {
 	for i := 0; i != 10; i++ {
 		if _, err := conn.Write([]byte(strconv.Itoa(i))); err != nil {
@@ -463,7 +490,9 @@ func testConnWriteReadSequentially(t *testing.T, conn *Conn) {
 }
 
 func testConnWriteBatchReadSequentially(t *testing.T, conn *Conn) {
-	if _, err := conn.WriteMessages(makeTestSequence(10)...); err != nil {
+	msgs := makeTestSequence(10)
+
+	if _, err := conn.WriteMessages(msgs...); err != nil {
 		t.Fatal(err)
 	}
 
@@ -473,11 +502,14 @@ func testConnWriteBatchReadSequentially(t *testing.T, conn *Conn) {
 			t.Error(err)
 			continue
 		}
-		s := string(msg.Value)
-		if v, err := strconv.Atoi(s); err != nil {
-			t.Error(err)
-		} else if v != i {
-			t.Errorf("bad message read at offset %d: %s", i, s)
+		if !bytes.Equal(msg.Key, msgs[i].Key) {
+			t.Errorf("bad message key at offset %d: %q != %q", i, msg.Key, msgs[i].Key)
+		}
+		if !bytes.Equal(msg.Value, msgs[i].Value) {
+			t.Errorf("bad message value at offset %d: %q != %q", i, msg.Value, msgs[i].Value)
+		}
+		if !msg.Time.Equal(msgs[i].Time) {
+			t.Errorf("bad message time at offset %d: %s != %s", i, msg.Time, msgs[i].Time)
 		}
 	}
 }
@@ -565,7 +597,7 @@ func createGroup(t *testing.T, conn *Conn, groupID string) (generationID int32, 
 	joinGroup := join()
 
 	// sync the group
-	_, err := conn.syncGroups(syncGroupRequestV0{
+	_, err := conn.syncGroup(syncGroupRequestV0{
 		GroupID:      groupID,
 		GenerationID: joinGroup.GenerationID,
 		MemberID:     joinGroup.MemberID,
@@ -577,7 +609,7 @@ func createGroup(t *testing.T, conn *Conn, groupID string) (generationID int32, 
 		},
 	})
 	if err != nil {
-		t.Fatalf("bad syncGroups: %s", err)
+		t.Fatalf("bad syncGroup: %s", err)
 	}
 
 	generationID = joinGroup.GenerationID
@@ -678,7 +710,7 @@ func testConnHeartbeatErr(t *testing.T, conn *Conn) {
 	groupID := makeGroupID()
 	createGroup(t, conn, groupID)
 
-	_, err := conn.syncGroups(syncGroupRequestV0{
+	_, err := conn.syncGroup(syncGroupRequestV0{
 		GroupID: groupID,
 	})
 	if err != UnknownMemberId && err != NotCoordinatorForGroup {
@@ -702,7 +734,7 @@ func testConnSyncGroupErr(t *testing.T, conn *Conn) {
 	groupID := makeGroupID()
 	waitForCoordinator(t, conn, groupID)
 
-	_, err := conn.syncGroups(syncGroupRequestV0{
+	_, err := conn.syncGroup(syncGroupRequestV0{
 		GroupID: groupID,
 	})
 	if err != UnknownMemberId && err != NotCoordinatorForGroup {
@@ -812,9 +844,11 @@ func testConnFetchAndCommitOffsets(t *testing.T, conn *Conn) {
 }
 
 func testConnWriteReadConcurrently(t *testing.T, conn *Conn) {
+
 	const N = 1000
 	var msgs = make([]string, N)
 	var done = make(chan struct{})
+	var written = make(chan struct{}, N/10)
 
 	for i := 0; i != N; i++ {
 		msgs[i] = strconv.Itoa(i)
@@ -826,12 +860,21 @@ func testConnWriteReadConcurrently(t *testing.T, conn *Conn) {
 			if _, err := conn.Write([]byte(msg)); err != nil {
 				t.Error(err)
 			}
+			written <- struct{}{}
 		}
 	}()
 
 	b := make([]byte, 128)
 
 	for i := 0; i != N; i++ {
+		// wait until at least one message has been written.  the reason for
+		// this synchronization is that we aren't using deadlines.  as such, if
+		// the read happens before a message is available, it will cause a
+		// deadlock because the read request will never hit the one byte minimum
+		// in order to return and release the lock on the conn.  by ensuring
+		// that there's at least one message produced, we don't hit that
+		// condition.
+		<-written
 		n, err := conn.Read(b)
 		if err != nil {
 			t.Error(err)
@@ -874,7 +917,7 @@ func testConnReadEmptyWithDeadline(t *testing.T, conn *Conn) {
 	b := make([]byte, 100)
 
 	start := time.Now()
-	deadline := start.Add(250 * time.Millisecond)
+	deadline := start.Add(time.Second)
 
 	conn.SetReadDeadline(deadline)
 	n, err := conn.Read(b)
@@ -978,6 +1021,23 @@ func testBrokers(t *testing.T, conn *Conn) {
 
 	if brokers[0].ID != 1 {
 		t.Errorf("expected ID 1 received %d", brokers[0].ID)
+	}
+}
+
+func TestReadPartitionsNoTopic(t *testing.T) {
+	conn, err := Dial("tcp", "127.0.0.1:9092")
+	if err != nil {
+		t.Error(err)
+	}
+	defer conn.Close()
+
+	parts, err := conn.ReadPartitions()
+	if err != nil {
+		t.Error(err)
+	}
+
+	if len(parts) == 0 {
+		t.Errorf("no partitions were returned")
 	}
 }
 
@@ -1146,4 +1206,18 @@ func benchmarkConnWrite(b *testing.B, conn *Conn, _ []byte) {
 	}
 
 	b.SetBytes(int64(n / i))
+}
+
+func TestEmptyToNullableReturnsNil(t *testing.T) {
+	if emptyToNullable("") != nil {
+		t.Error("Empty string is not converted to nil")
+	}
+}
+
+func TestEmptyToNullableLeavesStringsIntact(t *testing.T) {
+	const s = "abc"
+	r := emptyToNullable(s)
+	if *r != s {
+		t.Error("Non empty string is not equal to the original string")
+	}
 }
