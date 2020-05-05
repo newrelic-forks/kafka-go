@@ -1424,7 +1424,7 @@ func (r *reader) read(ctx context.Context, offset int64, conn *Conn) (int64, err
 }
 
 func (r *reader) readOffsets(conn *Conn) (first, last int64, err error) {
-	conn.SetDeadline(time.Now().Add(1 * time.Second))
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
 	return conn.ReadOffsets()
 }
 
