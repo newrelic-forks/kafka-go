@@ -1309,7 +1309,7 @@ func (d *connDeadline) setDeadline(t time.Time) {
 
 func (d *connDeadline) setConnReadDeadline(conn net.Conn) time.Time {
 	d.mutex.Lock()
-	deadline := d.value
+	deadline := time.Now().Local().Add(4 * time.Second)
 	d.rconn = conn
 	d.rconn.SetReadDeadline(deadline)
 	d.mutex.Unlock()
@@ -1318,7 +1318,7 @@ func (d *connDeadline) setConnReadDeadline(conn net.Conn) time.Time {
 
 func (d *connDeadline) setConnWriteDeadline(conn net.Conn) time.Time {
 	d.mutex.Lock()
-	deadline := d.value
+	deadline := time.Now().Local().Add(4 * time.Second)
 	d.wconn = conn
 	d.wconn.SetWriteDeadline(deadline)
 	d.mutex.Unlock()

@@ -248,11 +248,11 @@ func NewWriter(config WriterConfig) *Writer {
 	}
 
 	if config.ReadTimeout == 0 {
-		config.ReadTimeout = 10 * time.Second
+		config.ReadTimeout = 4 * time.Second
 	}
 
 	if config.WriteTimeout == 0 {
-		config.WriteTimeout = 10 * time.Second
+		config.WriteTimeout = 4 * time.Second
 	}
 
 	if config.RebalanceInterval == 0 {
